@@ -7,6 +7,15 @@ Original file is located at
     https://colab.research.google.com/drive/1RkPt1bg3jf8zFX8oohDswMxZutzdEzU3
 """
 
+!apt-get install -y tesseract-ocr
+!pip install pillow pytesseract
+!pip install "unstructured[all-docs]"
+!pip install langchain_chroma langchain langchain-community
+!pip install langchain-groq
+!apt-get update && apt-get install -y poppler-utils
+
+!pip install -U bitsandbytes transformers accelerate
+
 import base64
 import io
 import hashlib
@@ -22,6 +31,26 @@ from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+
+model_id = "mistralai/Mistral-7B-Instruct-v0.2"
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+llm = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
 
 OCR_CACHE = {}
 def ocr_images(image_base64_list):
@@ -75,32 +104,27 @@ def extract_modalities(chunk):
 
     return text, tables, images
 
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0
-)
-
-def summarize_chunk(text, tables, image_desc):
+def summarize_chunk(text, tables=None, image_desc=None):
     prompt = f"""
-You are creating a SEARCH-OPTIMIZED summary.
+You are a technical assistant.
 
-TEXT:
+Summarize the following content concisely.
+Focus on definitions, mechanisms, and equations.
+
+Text:
 {text}
-
-TABLES:
-{tables}
-
-IMAGE DESCRIPTIONS:
-{image_desc}
-
-TASK:
-- Extract key facts, numbers, definitions
-- Include alternative keywords
-- Mention questions this chunk can answer
-- Max 300 words
 """
 
-    return llm.invoke(prompt).content
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(llm.device)
+
+    outputs = llm.generate(
+        **inputs,
+        max_new_tokens=200,
+        do_sample=False,
+        temperature=0.0
+    )
+
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 def ingest_pdf_to_chroma(
     pdf_path: str,
@@ -156,33 +180,6 @@ def search(db, query, k=3):
     retriever = db.as_retriever(search_kwargs={"k": k})
     return retriever.invoke(query)
 
-def answer_question(chunks, query):
-    docs = db.similarity_search(query, k=5)
-
-    context = ""
-    for d in docs:
-        context += d.metadata.get("raw_text", "") + "\n"
-
-    prompt = f"""
-Answer the question using ONLY the context below.
-If the answer is not present, say you don't know.
-
-IMPORTANT:
-- Explicitly extract and state ALL numbers, dimensions, counts, and hyperparameters.
-- If a number appears in text or tables, it MUST be written verbatim.
-
-
-QUESTION:
-{query}
-
-CONTEXT:
-{context}
-
-ANSWER:
-"""
-
-    return llm.invoke(prompt).content
-
 from google.colab import files
 files.upload()
 
@@ -197,8 +194,108 @@ for i, d in enumerate(docs):
     print(f"\n--- DOC {i+1} ---\n")
     print(d.page_content[:800])
 
+def answer_question(chunks, query):
+    # chunks is List[Document]
+    context = "\n\n".join([doc.page_content for doc in chunks])
+
+    prompt = f"""
+<s>[INST]
+You are a technical assistant.
+
+Answer the question using ONLY the context below.
+If the answer is not present, say "I don't know".
+
+Context:
+{context}
+
+Question:
+{query}
+[/INST]
+"""
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=4096
+    ).to(llm.device)
+
+    outputs = llm.generate(
+        **inputs,
+        max_new_tokens=256,
+        do_sample=False,
+        temperature=0.0
+    )
+
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer.split("[/INST]")[-1].strip()
+
 # Run many times
-query = "What trade-offs are discussed regarding attention head count?"
+query = "What design choices distinguish the original Transformer from later variants?"
 chunks = search(db, query)
 print(answer_question(chunks, query))
+
+def answer_no_rag(query):
+    prompt = f"""
+<s>[INST]
+Answer the question as best as you can.
+[/INST]
+
+Question:
+{query}
+"""
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
+    outputs = llm.generate(
+        **inputs,
+        max_new_tokens=256,
+        do_sample=False,
+        temperature=0.0
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Run many times
+query = "What design choices distinguish the original Transformer from later variants?"
+chunks = search(db, query)
+print(answer_no_rag(query))
+
+def grounding_score(answer, chunks):
+    context = " ".join(doc.page_content for doc in chunks).lower()
+    answer_words = answer.lower().split()
+
+    supported = sum(1 for w in answer_words if w in context)
+    return supported / max(len(answer_words), 1)
+
+answer_wo_rag = answer_no_rag(query)
+no_rag = grounding_score(answer_wo_rag, chunks)
+
+answer_w_rag = answer_question(chunks, query)
+rag = grounding_score(answer_w_rag, chunks)
+
+print("no rag answer ", no_rag)
+print("rag answer ", rag)
+
+from numpy import dot
+from numpy.linalg import norm
+
+def cosine_sim(a, b):
+    return dot(a, b) / (norm(a) * norm(b) + 1e-8)
+
+def relevance_score(answer, question, embedder):
+    a_emb = embedder.embed_query(answer)
+    q_emb = embedder.embed_query(question)
+    return cosine_sim(a_emb, q_emb)
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+embedder = HuggingFaceEmbeddings(
+    model_name="all-MiniLM-L6-v2"
+)
+
+no_rag_relevance_score = relevance_score(answer_wo_rag, query, embeddings)
+
+rag_relevance_score = relevance_score(answer_w_rag, query, embedder)
+
+print("without rag relevance score : ", no_rag_relevance_score)
+print("with rag relevance score : ", rag_relevance_score)
 
